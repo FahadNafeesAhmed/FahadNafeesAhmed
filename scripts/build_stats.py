@@ -1,224 +1,201 @@
-"""Rebuild the live cards in assets/generated/ from public GitHub data.
+"""Generate static profile SVGs from public GitHub data. Standard library only."""
 
-Runs daily in .github/workflows/stats.yml. Standard library only.
-"""
 import datetime as dt
 import json
 import math
 import os
+from collections import defaultdict
+from html.parser import HTMLParser
+from pathlib import Path
 import re
 import urllib.request
 from xml.sax.saxutils import escape
 
 USER = os.environ.get("GH_USER", "FahadNafeesAhmed")
 TOKEN = os.environ.get("GITHUB_TOKEN", "")
-OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets", "generated")
-
-SANS = "'Segoe UI',-apple-system,BlinkMacSystemFont,'Helvetica Neue',Helvetica,Arial,sans-serif"
-MONO = "'JetBrains Mono','Cascadia Code','SFMono-Regular',Consolas,Menlo,'Liberation Mono',monospace"
-C = dict(bg="#0A0E16", bg2="#0E1524", border="#1d2940", text="#E6EDF6", muted="#8C9BB5", dim="#4A5872",
-         faint="#243049", mint="#5EEAD4", cyan="#38BDF8", violet="#A78BFA", pink="#F472B6", amber="#FBBF24",
-         green="#4ADE80")
-PALETTE = [C["mint"], C["cyan"], C["violet"], C["pink"], C["amber"], C["green"]]
-LANG_MAP = {"Jupyter Notebook": "Python"}
-LANG_SKIP = {"HTML", "CSS", "SCSS", "Shell", "Dockerfile", "Makefile", "PowerShell", "Batchfile", "Procfile"}
+ASSETS = Path(__file__).resolve().parents[1] / "assets"
 
 
 def get(url, api=True):
-    req = urllib.request.Request(url, headers={"User-Agent": f"{USER}-profile-stats"})
+    headers = {"User-Agent": f"{USER}-profile-stats"}
     if api:
-        req.add_header("Accept", "application/vnd.github+json")
+        headers["Accept"] = "application/vnd.github+json"
         if TOKEN:
-            req.add_header("Authorization", f"Bearer {TOKEN}")
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return r.read().decode("utf-8")
+            headers["Authorization"] = f"Bearer {TOKEN}"
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as response:
+        return response.read().decode("utf-8")
+
+
+class CalendarParser(HTMLParser):
+    """Read cell dates and tooltip counts without depending on attribute order."""
+
+    def __init__(self):
+        super().__init__()
+        self.dates = {}
+        self.tips = {}
+        self.current = None
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if "data-date" in attrs and "id" in attrs:
+            self.dates[attrs["id"]] = dt.date.fromisoformat(attrs["data-date"])
+        if tag == "tool-tip":
+            self.current = attrs.get("for")
+            self.tips[self.current] = ""
+
+    def handle_data(self, data):
+        if self.current is not None:
+            self.tips[self.current] += data
+
+    def handle_endtag(self, tag):
+        if tag == "tool-tip":
+            self.current = None
 
 
 def contributions():
-    """Daily counts for the last year, scraped from the public contribution calendar."""
-    html = get(f"https://github.com/users/{USER}/contributions", api=False)
-    ids = re.findall(r'data-date="(\d{4}-\d\d-\d\d)" id="(contribution-day-component-\d+-\d+)"', html)
-    tips = dict(re.findall(r'for="(contribution-day-component-\d+-\d+)"[^>]*>([^<]*)</tool-tip>', html))
+    parser = CalendarParser()
+    parser.feed(get(f"https://github.com/users/{USER}/contributions", api=False))
     days = []
-    for date, cid in ids:
-        m = re.match(r"([\d,]+) contribution", tips.get(cid, ""))
-        days.append((dt.date.fromisoformat(date), int(m.group(1).replace(",", "")) if m else 0))
-    if len(days) < 300:
-        raise SystemExit(f"contribution calendar parse failed ({len(days)} days); keeping old cards")
-    return sorted(days)
-
-
-def streaks(days):
-    longest = run = 0
-    for _, n in days:
-        run = run + 1 if n else 0
-        longest = max(longest, run)
-    cur, i = 0, len(days) - 1
-    if days[i][1] == 0:  # today may not have started yet
-        i -= 1
-    while i >= 0 and days[i][1]:
-        cur, i = cur + 1, i - 1
-    return cur, longest
+    for cell, date in parser.dates.items():
+        label = parser.tips.get(cell, "").strip()
+        match = re.match(r"([\d,]+) contributions?\b", label)
+        if match:
+            count = int(match[1].replace(",", ""))
+        elif label.lower().startswith("no contributions"):
+            count = 0
+        else:
+            raise ValueError(f"Unknown contribution tooltip for {date}; preserving previous charts")
+        days.append((date, count))
+    days.sort()
+    if len(days) < 300 or any((b[0] - a[0]).days != 1 for a, b in zip(days, days[1:])):
+        raise ValueError("Incomplete contribution calendar; preserving previous charts")
+    return days
 
 
 def repos_and_languages():
-    repos = json.loads(get(f"https://api.github.com/users/{USER}/repos?per_page=100&type=owner"))
-    own = [r for r in repos if not r["fork"] and r["name"].lower() != USER.lower()]
-    share = {}
-    for r in own:
-        langs = json.loads(get(r["languages_url"]))
-        code = {}
-        for k, v in langs.items():
-            k = LANG_MAP.get(k, k)
-            if k not in LANG_SKIP:
-                code[k] = code.get(k, 0) + v
-        total = sum(code.values())
-        for k, v in code.items():  # every project counts once, split by its bytes
-            share[k] = share.get(k, 0) + v / total
-    stars = sum(r["stargazers_count"] for r in own)
-    return len(own), stars, sorted(share.items(), key=lambda kv: -kv[1])
+    repos = []
+    page = 1
+    while True:
+        batch = json.loads(get(f"https://api.github.com/users/{USER}/repos?per_page=100&type=owner&page={page}"))
+        repos.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    own = [repo for repo in repos if not repo["fork"] and repo["name"].lower() != USER.lower()]
+    share = defaultdict(float)
+    for repo in own:
+        languages = json.loads(get(repo["languages_url"]))
+        total = sum(languages.values())
+        if total:
+            for name, size in languages.items():
+                share[name] += size / total
+    return len(own), sorted(share.items(), key=lambda item: (-item[1], item[0]))
 
 
-def svg(w, h, body, css, title):
-    return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}" fill="none" role="img">'
-            f"<title>{escape(title)}</title><style>text{{font-family:{SANS}}}.m{{font-family:{MONO}}}{css}"
-            "@media (prefers-reduced-motion: reduce){*{animation:none!important}}</style>"
-            f'<defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="{C["bg2"]}"/>'
-            f'<stop offset="1" stop-color="{C["bg"]}"/></linearGradient></defs>'
-            f'<rect x=".5" y=".5" width="{w-1}" height="{h-1}" rx="16" fill="url(#bg)" stroke="{C["border"]}"/>{body}</svg>')
+def text(x, y, value, size=14, cls="text", **attrs):
+    attributes = " ".join(f'{key.replace("_", "-")}="{value}"' for key, value in attrs.items())
+    return f'<text x="{x}" y="{y}" font-size="{size}" class="{cls}" {attributes}>{escape(str(value))}</text>'
 
 
-def head(label, title):
-    return (f'<text class="m" x="24" y="36" font-size="11.5" fill="{C["muted"]}" letter-spacing="1">{label}</text>'
-            f'<text x="24" y="62" font-size="19" font-weight="700" fill="{C["text"]}">{escape(title)}</text>')
+def svg(width, height, title, description, body):
+    return f'''<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-labelledby="title desc">
+<title id="title">{escape(title)}</title><desc id="desc">{escape(description)}</desc>
+<style>
+text{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif}}
+.bg{{fill:#ffffff;stroke:#d0d7de}}.text{{fill:#1f2328}}.muted{{fill:#59636e}}
+.track{{fill:#eaeef2}}.grid{{stroke:#eaeef2}}.accent{{fill:#0969da}}.icon{{stroke:#0969da;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}}
+@media(prefers-color-scheme:dark){{.bg{{fill:#0d1117;stroke:#30363d}}.text{{fill:#e6edf3}}.muted{{fill:#9da7b3}}.track{{fill:#21262d}}.grid{{stroke:#21262d}}.accent{{fill:#58a6ff}}.icon{{stroke:#58a6ff}}}}
+</style>
+<rect class="bg" x="0.5" y="0.5" width="{width-1}" height="{height-1}" rx="10"/>
+{body}
+</svg>\n'''
 
 
-def stats_card(days, n_repos, stars, today):
-    total = sum(n for _, n in days)
-    cur, longest = streaks(days)
-    active = sum(1 for _, n in days if n)
-    weeks = [sum(n for _, n in days[i:i + 7]) for i in range(0, len(days), 7)]
-    top = max(weeks) or 1
-    x0, x1, y0, y1 = 24, 416, 172, 222
-    pts = [(x0 + (x1 - x0) * i / (len(weeks) - 1), y1 - (y1 - y0) * v / top) for i, v in enumerate(weeks)]
-    line = "M" + " L".join(f"{x:.1f} {y:.1f}" for x, y in pts)
-    area = line + f" L{x1} {y1} L{x0} {y1} Z"
-    rows = [("current streak", f"{cur} day{'s' * (cur != 1)}", C["mint"]),
-            ("longest streak", f"{longest} days", C["cyan"]),
-            ("active days", f"{active}", C["violet"])]
-    body = head("// GITHUB", "The last 12 months")
-    body += (f'<text x="24" y="118" font-size="46" font-weight="800" fill="url(#g)" class="up">{total:,}</text>'
-             f'<text x="26" y="140" font-size="12.5" fill="{C["muted"]}">contributions</text>'
-             f'<defs><linearGradient id="g" x1="0" x2="1"><stop offset="0" stop-color="{C["mint"]}"/><stop offset="1" stop-color="{C["cyan"]}"/></linearGradient>'
-             f'<linearGradient id="a" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="{C["mint"]}" stop-opacity=".35"/>'
-             f'<stop offset="1" stop-color="{C["mint"]}" stop-opacity="0"/></linearGradient></defs>')
-    for i, (lab, val, col) in enumerate(rows):
-        y = 92 + i * 24
-        body += (f'<text x="236" y="{y}" font-size="12.5" fill="{C["muted"]}">{lab}</text>'
-                 f'<text class="m up" x="416" y="{y}" font-size="13" font-weight="700" fill="{col}" text-anchor="end" '
-                 f'style="animation-delay:{.2+i*.12:.2f}s">{val}</text>')
-    body += (f'<path d="{area}" fill="url(#a)"/><path class="ln" d="{line}" stroke="{C["mint"]}" stroke-width="1.8" stroke-linejoin="round"/>'
-             f'<text class="m" x="{x0}" y="{y1+16}" font-size="9.5" fill="{C["dim"]}">{days[0][0]:%b %Y}</text>'
-             f'<text class="m" x="{x1}" y="{y1+16}" font-size="9.5" fill="{C["dim"]}" text-anchor="end">weekly · {today:%b %Y}</text>'
-             f'<text class="m" x="416" y="36" font-size="10" fill="{C["dim"]}" text-anchor="end">{n_repos} projects · {stars} ★</text>')
-    css = (".up{opacity:0;animation:up .6s ease-out forwards}@keyframes up{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}"
-           ".ln{stroke-dasharray:1400;stroke-dashoffset:1400;animation:dr 2.2s ease-out forwards}@keyframes dr{to{stroke-dashoffset:0}}")
-    return svg(440, 250, body, css, f"{total} contributions in the last year")
+def stats_card(days, n_repos, today):
+    total = sum(count for _, count in days)
+    active = sum(count > 0 for _, count in days)
+    weeks = defaultdict(int)
+    for day, count in days:
+        weeks[day - dt.timedelta(days=day.weekday())] += count
+    values = list(weeks.values())
+    ceiling = max(5, math.ceil(max(values, default=0) / 5) * 5)
+    body = text(24, 34, "Contribution activity", 19, font_weight="600")
+    body += text(24, 58, f"{days[0][0]:%b %Y} – {days[-1][0]:%b %Y} · weekly totals", 12, "muted")
+    body += text(24, 99, f"{total:,}", 29, font_weight="600")
+    body += text(24, 120, "contributions", 12, "muted")
+    body += text(187, 98, active, 25, font_weight="600")
+    body += text(187, 120, "active days", 12, "muted")
+    body += text(326, 98, n_repos, 25, font_weight="600")
+    body += text(326, 120, "public repos", 12, "muted")
+    x0, y0, width, height = 48, 222, 366, 72
+    for value in (0, ceiling / 2, ceiling):
+        y = y0 - value / ceiling * height
+        body += f'<path class="grid" d="M{x0} {y}h{width}"/>'
+        body += text(39, y + 4, f"{value:g}", 10, "muted", text_anchor="end")
+    step = width / len(values)
+    for index, (start, count) in enumerate(weeks.items()):
+        bar_height = count / ceiling * height
+        body += f'<rect class="accent" x="{x0+index*step:.2f}" y="{y0-bar_height:.2f}" width="{max(1, step-2):.2f}" height="{bar_height:.2f}" rx="1"><title>Week of {start}: {count} contributions</title></rect>'
+    body += text(x0, 240, f"{days[0][0]:%b %Y}", 10, "muted")
+    body += text(414, 240, f"{days[-1][0]:%b %Y}", 10, "muted", text_anchor="end")
+    body += text(24, 268, f"GitHub contribution calendar · updated {today:%d %b %Y}", 10, "muted")
+    return svg(440, 286, "GitHub contribution activity", f"{total} contributions over {active} active days. Weekly bars use a zero baseline. Counts follow the public GitHub contribution calendar.", body)
 
 
-def languages_card(share):
-    top = share[:6]
-    rest = sum(v for _, v in share[6:])
-    if rest:
-        top.append(("Other", rest))
-    total = sum(v for _, v in top)
-    cx, cy, r, sw = 110, 152, 58, 20
-    circ = 2 * math.pi * r
-    body = head("// LANGUAGES", "Share of my projects")
-    off = 0.0
-    for i, (name, v) in enumerate(top):
-        frac = v / total
-        col = PALETTE[i] if name != "Other" else C["dim"]
-        body += (f'<circle class="seg" cx="{cx}" cy="{cy}" r="{r}" stroke="{col}" stroke-width="{sw}" '
-                 f'stroke-dasharray="{max(frac*circ-2, .5):.2f} {circ:.2f}" stroke-dashoffset="{-off:.2f}" '
-                 f'transform="rotate(-90 {cx} {cy})" style="animation-delay:{i*.1:.1f}s"/>')
-        off += frac * circ
-        y = 96 + i * 22
-        body += (f'<g class="up" style="animation-delay:{.2+i*.08:.2f}s"><circle cx="228" cy="{y-4}" r="4.5" fill="{col}"/>'
-                 f'<text x="242" y="{y}" font-size="13" fill="{C["text"]}">{escape(name)}</text>'
-                 f'<text class="m" x="416" y="{y}" font-size="12.5" fill="{C["muted"]}" text-anchor="end">{100*frac:.1f}%</text></g>')
-    body += (f'<text x="{cx}" y="{cy+2}" font-size="22" font-weight="800" fill="{C["text"]}" text-anchor="middle">{len(share)}</text>'
-             f'<text x="{cx}" y="{cy+18}" font-size="10.5" fill="{C["muted"]}" text-anchor="middle">languages</text>'
-             f'<text class="m" x="24" y="236" font-size="9.5" fill="{C["dim"]}">each project counts once, split by its code</text>')
-    css = (".seg{opacity:0;animation:fi .8s ease-out forwards}@keyframes fi{to{opacity:1}}"
-           ".up{opacity:0;animation:up .5s ease-out forwards}@keyframes up{from{opacity:0;transform:translateX(-4px)}to{opacity:1;transform:none}}")
-    return svg(440, 250, body, css, "Languages across my projects")
+def languages_card(share, today):
+    top = share[:5]
+    if len(share) > 5:
+        top.append(("Other", sum(value for _, value in share[5:])))
+    total = sum(value for _, value in top)
+    colors = ["#3572a5", "#3178c6", "#b59410", "#168ca6", "#8250df", "#6e7781"]
+    body = text(24, 34, "Languages across projects", 19, font_weight="600")
+    body += text(24, 58, "Public repositories · excluding forks and this profile", 12, "muted")
+    summary = []
+    for index, (name, value) in enumerate(top):
+        fraction = value / total if total else 0
+        y = 89 + index * 27
+        body += text(24, y, name, 12)
+        body += f'<rect class="track" x="164" y="{y-9}" width="194" height="7" rx="3.5"/>'
+        body += f'<rect x="164" y="{y-9}" width="{194*fraction:.2f}" height="7" rx="3.5" fill="{colors[index]}"/>'
+        body += text(416, y, f"{fraction:.1%}", 12, "muted", text_anchor="end")
+        summary.append(f"{name}: {fraction:.1%}")
+    if not top:
+        body += text(24, 115, "No language data available.", 14, "muted")
+    body += text(24, 250, "Each repository has equal weight, split by code bytes.", 10, "muted")
+    body += text(24, 268, f"GitHub language data · updated {today:%d %b %Y}", 10, "muted")
+    return svg(440, 286, "Languages across public projects", "; ".join(summary) + ". Repository-weighted code distribution, not skill proficiency.", body)
 
 
-def shade(hex_color, k):
-    r, g, b = (int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
-    return f"#{int(r*k):02x}{int(g*k):02x}{int(b*k):02x}"
-
-
-def activity_card(days):
-    W, H = 900, 290
-    first = days[0][0] - dt.timedelta(days=(days[0][0].weekday() + 1) % 7)
-    cw, s, dx, dy, dep = 14.6, 10.6, 5.0, 7.0, 0.72
-    X0, Y0 = 36, 200
-    mx = max(n for _, n in days) or 1
-    nz = sorted(n for _, n in days if n)
-    q = [nz[int(len(nz) * f)] for f in (.25, .5, .75)] if nz else [1, 2, 3]
-    tops = ["#172238", "#0f5e55", "#149c88", "#2dd4bf", "#a7f3e4"]
-    cols = {}
-    for day, n in days:
-        w, d = (day - first).days // 7, (day.weekday() + 1) % 7
-        cols.setdefault(w, []).append((d, n, day))
-    body = head("// CONTRIBUTIONS", "A year of building, in 3D")
-    busiest = max(days, key=lambda t: t[1])
-    body += (f'<text class="m" x="{W-24}" y="36" font-size="11" fill="{C["muted"]}" text-anchor="end">'
-             f'{sum(n for _, n in days):,} contributions · busiest day {busiest[0]:%b %d} ({busiest[1]})</text>')
-    lx = W - 24 - 28 - 5 * 16
-    body += f'<text class="m" x="{lx-8}" y="60" font-size="10" fill="{C["dim"]}" text-anchor="end">less</text>'
-    for i, c in enumerate(tops):
-        body += f'<rect x="{lx+i*16}" y="51" width="11" height="11" rx="2" fill="{c}"/>'
-    body += f'<text class="m" x="{lx+5*16+2}" y="60" font-size="10" fill="{C["dim"]}">more</text>'
-    ddx, ddy = dx * dep, dy * dep
-    for w in sorted(cols):
-        g = ""
-        for d, n, day in sorted(cols[w]):
-            x, y = X0 + w * cw + (6 - d) * dx, Y0 + d * dy
-            lvl = 0 if n == 0 else 1 + sum(n > t for t in q)
-            h = 0 if n == 0 else 4 + 86 * math.sqrt(n / mx)
-            top = tops[lvl]
-            if h:
-                g += (f'<path d="M{x:.1f} {y:.1f}h{s}v{-h:.1f}h{-s}z" fill="{shade(top, .62)}"/>'
-                      f'<path d="M{x+s:.1f} {y:.1f}l{ddx:.1f} {-ddy:.1f}v{-h:.1f}l{-ddx:.1f} {ddy:.1f}z" fill="{shade(top, .42)}"/>')
-            g += (f'<path d="M{x:.1f} {y-h:.1f}h{s}l{ddx:.1f} {-ddy:.1f}h{-s}z" fill="{top}"><title>{n} on {day:%b %d}</title></path>')
-        body += f'<g class="c" style="animation-delay:{w*.018:.3f}s">{g}</g>'
-    seen = set()
-    for w in sorted(cols):
-        day = min(t[2] for t in cols[w])
-        if day.day <= 7 and day.month not in seen and w > 0:
-            seen.add(day.month)
-            body += (f'<text class="m" x="{X0 + w*cw:.1f}" y="{Y0 + 6*dy + 22}" font-size="10" '
-                     f'fill="{C["dim"]}">{day:%b}</text>')
-    css = (".c{transform-box:fill-box;transform-origin:50% 100%;transform:scaleY(0);animation:rise .9s cubic-bezier(.2,.8,.2,1) forwards}"
-           "@keyframes rise{to{transform:scaleY(1)}}")
-    return svg(W, H, body, css, "Contribution skyline for the last year")
+def stack_card():
+    groups = [
+        (24, 26, "Languages", "Python · C++ · C · TypeScript", "JavaScript · MATLAB · Verilog", '<path d="m8 6-6 6 6 6m8-12 6 6-6 6m-3-16-3 20"/>'),
+        (464, 26, "Machine learning & vision", "PyTorch · CUDA · OpenCV", "NumPy · SciPy · OpenUSD", '<circle cx="4" cy="5" r="3"/><circle cx="20" cy="5" r="3"/><circle cx="12" cy="21" r="3"/><path d="M7 5h10M5.5 8l5 10m8-10-5 10"/>'),
+        (24, 151, "Software & infrastructure", "React · Next.js · FastAPI", "Docker · Google Cloud · GitHub Actions", '<rect x="1" y="2" width="22" height="9" rx="2"/><rect x="1" y="15" width="22" height="9" rx="2"/><path d="M5 6.5h1m-1 13h1m5-13h8m-8 13h8"/>'),
+        (464, 151, "Hardware & design", "FPGA development · Quartus", "LTspice · SolidWorks", '<rect x="5" y="5" width="16" height="16" rx="2"/><rect x="9" y="9" width="8" height="8" rx="1"/><path d="M9 1v4m8-4v4M9 21v4m8-4v4M1 9h4m-4 8h4M21 9h4m-4 8h4"/>'),
+    ]
+    body = '<path class="grid" d="M450 24v230M24 136h852"/>'
+    for x, y, title, first, second, icon in groups:
+        body += f'<g class="icon" transform="translate({x},{y})">{icon}</g>'
+        body += text(x+40, y+19, title, 19, font_weight="600")
+        body += text(x, y+58, first, 16)
+        body += text(x, y+86, second, 16, "muted")
+    return svg(900, 278, "Technical stack", "Languages, machine learning and vision, software and infrastructure, and hardware and design tools.", body)
 
 
 def main():
-    os.makedirs(OUT, exist_ok=True)
-    today = dt.date.today()
+    today = dt.datetime.now(dt.timezone.utc).date()
     days = contributions()
-    n_repos, stars, share = repos_and_languages()
-    cards = {"stats.svg": stats_card(days, n_repos, stars, today),
-             "languages.svg": languages_card(share),
-             "activity.svg": activity_card(days)}
-    for name, content in cards.items():
-        with open(os.path.join(OUT, name), "w", encoding="utf-8", newline="\n") as f:
-            f.write(content)
-        print(f"wrote {name} ({len(content)/1024:.1f} KB)")
+    n_repos, share = repos_and_languages()
+    cards = {
+        ASSETS / "stack.svg": stack_card(),
+        ASSETS / "generated" / "stats.svg": stats_card(days, n_repos, today),
+        ASSETS / "generated" / "languages.svg": languages_card(share, today),
+    }
+    # Fetch and validate all data before replacing any current assets.
+    for path, content in cards.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8", newline="\n")
+        print(f"Wrote {path.name}")
 
 
 if __name__ == "__main__":

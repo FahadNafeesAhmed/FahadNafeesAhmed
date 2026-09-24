@@ -47,7 +47,23 @@ Python, FastAPI, React, Prometheus
 
 ## Technical skills
 
+![Technical stack: languages, machine learning and vision, software and infrastructure, hardware and design](assets/stack.svg)
+
+<details>
+<summary>Full tool list</summary>
+
 - **Languages:** Python, C++, C, TypeScript, JavaScript, MATLAB, Verilog
 - **Machine learning and vision:** PyTorch, CUDA, OpenCV, NumPy, SciPy
 - **Software and infrastructure:** React, Next.js, FastAPI, Docker, Google Cloud, GitHub Actions
 - **Hardware and design:** FPGA development, Quartus, LTspice, SolidWorks
+
+</details>
+
+## GitHub activity
+
+<p>
+  <img src="assets/generated/stats.svg" width="440" alt="Weekly GitHub contributions, total contributions, active days, and public repository count over the past year.">
+  <img src="assets/generated/languages.svg" width="440" alt="Language distribution across public projects. Each repository is weighted equally and split by its code bytes; forks and this profile are excluded.">
+</p>
+
+<sub>Charts refresh daily from GitHub. Language shares describe repository contents, not proficiency.</sub>
